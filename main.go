@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -170,16 +171,23 @@ func getBurnBanStatus(doc *goquery.Document) BurnBanStatus {
 }
 
 func (t *Trogdor) writeStatus(status BurnBanStatus) error {
-
-	_, err := t.db.Exec("Insert into burn_ban(status, created_at) values(?, ?)", status.String(), time.Now())
+	tx, err := t.db.BeginTx(context.Background(), nil)
+	_, err = tx.Exec("update burn_ban set is_active = 0 where is_active = 1")
 	if err != nil {
+		tx.Rollback()
 		return err
 	}
+	_, err = t.db.Exec("Insert into burn_ban(status, is_active, created_at) values(?,?, ?)", status.String(), 1, time.Now())
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	tx.Commit()
 	return nil
 }
 
 func (t *Trogdor) readPreviousStatus() (BurnBanStatus, error) {
-	row := t.db.QueryRow("Select status from burn_ban order by created_at desc limit 1;")
+	row := t.db.QueryRow("Select status from burn_ban where is_active=1;")
 	if row == nil {
 		return ON, errors.New("no data found in db for previous status")
 	}
