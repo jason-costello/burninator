@@ -1,14 +1,16 @@
 package main
 
 import (
-	"bufio"
+	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
+	_ "github.com/lib/pq"
 	twilio "github.com/twilio/twilio-go"
 	openapi "github.com/twilio/twilio-go/rest/api/v2010"
-	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,16 +29,43 @@ const (
 	ON  BurnBanStatus = "On"
 )
 
+type Trogdor struct {
+	twilioClient *twilio.RestClient
+	db           *sql.DB
+	config       config
+}
+
 type config struct {
 	TwilioAcctSID     string
 	TwilioMsgSID      string
 	TwilioAuthToken   string
 	TwilioPhoneNumber string
 	BurnBanURL        string
+	DBUser            string
+	DBPass            string
+	DBHost            string
+	DBPort            int
+	DBName            string
+	DBSSLMode         string
 	ToAddresses       []string
 	PollingInterval   time.Duration
 }
 
+func NewClient() *Trogdor {
+	conf := getConfig()
+	tc := twilio.NewRestClientWithParams(
+		twilio.ClientParams{
+			Username: conf.TwilioAcctSID,
+			Password: conf.TwilioAuthToken,
+		})
+
+	return &Trogdor{
+		twilioClient: tc,
+		db:           nil,
+		config:       config{},
+	}
+
+}
 func getConfig() config {
 	var conf config
 	conf.TwilioAcctSID = os.Getenv("TWILIO_ACCOUNT_SID")
@@ -54,29 +83,53 @@ func getConfig() config {
 	if conf.TwilioPhoneNumber == "" || conf.TwilioAuthToken == "" || conf.TwilioAcctSID == "" || conf.BurnBanURL == "" || len(conf.ToAddresses) < 1 {
 		panic(fmt.Sprintf("config not complete, has empty values: %#+v\n", conf))
 	}
+
+	conf.DBUser = os.Getenv("DBUSER")
+	conf.DBPass = os.Getenv("DBPASS")
+	conf.DBHost = os.Getenv("DBHOST")
+	dbp, err := strconv.Atoi(os.Getenv("DBPORT"))
+	if err != nil {
+		panic(err)
+	}
+	conf.DBPort = dbp
+	conf.DBName = os.Getenv("DBNAME")
+	conf.DBSSLMode = os.Getenv("DBSSLMODE")
+
 	return conf
 }
 
 func main() {
-	conf := getConfig()
-	fp := "bbstatus_ON.txt"
 
-	c := time.Tick(conf.PollingInterval)
+	b := NewClient()
+	dbConnStr := fmt.Sprintf("host=%s port=%d user=%s "+
+		"password=%s dbname=%s sslmode=disable",
+		b.config.DBHost, b.config.DBPort, b.config.DBUser, b.config.DBPass, b.config.DBName)
+
+	db, err := sql.Open("postgres", dbConnStr)
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+	err = db.Ping()
+	if err != nil {
+		panic(err)
+	}
+	c := time.Tick(b.config.PollingInterval)
 	for _ = range c {
-		status, err := GetBurnBanStatus(conf.BurnBanURL)
+		status, err := GetBurnBanStatus(b.config.BurnBanURL)
 		if err != nil {
 			fmt.Println("Error processing, default to ON")
 		}
-		previousStatus, err := readPreviousStatus(fp)
+		previousStatus, err := b.readPreviousStatus()
 		if err != nil {
 			previousStatus = ON
 		}
 
 		if previousStatus != status {
-			if err := writeStatus(fp, status); err != nil {
+			if err := b.writeStatus(status); err != nil {
 				fmt.Println("error returned from writing status: ", err)
 			}
-			if err := sendNotification(conf, status); err != nil {
+			if err := b.sendNotification(b.config, status); err != nil {
 				fmt.Println("error sending notifications: ", err)
 			}
 			fmt.Println("Status Changed, send notification")
@@ -116,81 +169,32 @@ func getBurnBanStatus(doc *goquery.Document) BurnBanStatus {
 	return status
 }
 
-func writeStatus(filePath string, status BurnBanStatus) error {
-	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+func (t *Trogdor) writeStatus(status BurnBanStatus) error {
+
+	_, err := t.db.Exec("Insert into burn_ban(status, created_at) values(?, ?)", status.String(), time.Now())
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	tm := time.Now().Format(time.RFC3339)
-	statusStr := status.String()
-	if statusStr == "On" {
-		statusStr = "On "
-	}
-
-	payload := fmt.Sprintf("%s::%s\n", statusStr, tm)
-
-	if _, err = f.WriteString(payload); err != nil {
 		return err
 	}
 	return nil
 }
 
-func readPreviousStatus(filePath string) (BurnBanStatus, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
+func (t *Trogdor) readPreviousStatus() (BurnBanStatus, error) {
+	row := t.db.QueryRow("Select status from burn_ban order by created_at desc limit 1;")
+	if row == nil {
+		return ON, errors.New("no data found in db for previous status")
+	}
+	var status string
+
+	if err := row.Scan(&status); err != nil {
 		return ON, err
 	}
-	defer f.Close()
 
-	previousStatus := ON
-	bytesPerLine := 31
-	reader := bufio.NewReader(f)
-	buffer := make([]byte, bytesPerLine)
+	return BurnBanStatus(status), nil
 
-	lineCount := 0
-	byteCount := 0
-
-	for {
-		_, err := reader.Read(buffer)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return ON, err
-		}
-		lineCount++
-		byteCount += bytesPerLine
-	}
-	ret, err := f.Seek(0, 2)
-	ret = ret - int64(bytesPerLine)
-	if err != nil {
-		fmt.Println("error seeking: ", err)
-		return ON, err
-	}
-	if _, err := f.ReadAt(buffer, ret); err != nil {
-		return ON, err
-	}
-	line := fmt.Sprint(strings.TrimSpace(string(buffer)))
-	rawStatus := strings.Split(line, "::")[0]
-	line = strings.TrimSpace(rawStatus)
-
-	previousStatusStr := strings.ToUpper(line)
-	if strings.ToUpper(previousStatusStr) == strings.ToUpper(OFF.String()) {
-		previousStatus = OFF
-	} else {
-		previousStatus = ON
-	}
-	return previousStatus, nil
 }
 
-func sendNotification(conf config, status BurnBanStatus) error {
-	client := twilio.NewRestClientWithParams(
-		twilio.ClientParams{
-			Username: conf.TwilioAcctSID,
-			Password: conf.TwilioAuthToken,
-		})
+func (b *Trogdor) sendNotification(conf config, status BurnBanStatus) error {
+
 	params := &openapi.CreateMessageParams{}
 	params.SetFrom(conf.TwilioPhoneNumber)
 	params.SetBody("Burn Ban is " + status.String())
@@ -198,7 +202,7 @@ func sendNotification(conf config, status BurnBanStatus) error {
 	for _, addr := range conf.ToAddresses {
 		time.Sleep(1 * time.Second)
 		params.SetTo(addr)
-		_, err := client.Api.CreateMessage(params)
+		_, err := b.twilioClient.Api.CreateMessage(params)
 		if err != nil {
 			fmt.Printf("%v: %q failed to send: %s\n", time.Now().String(), fmt.Sprintf("Burn Ban is %s", status.String()), err.Error())
 			return err
